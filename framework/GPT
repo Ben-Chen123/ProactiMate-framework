@@ -6,10 +6,10 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import json  # Import the json module
 import os
 
-openai.api_key ='sk-5qgKSM8d9qiar7eFjsJV51Z0Ad4rCuSG0OPOJuDGvrHqFHpM'
+openai.api_key =''
 openai.base_url = "https://api.chatanywhere.org"
 #openai.default_headers = {"x-foo": "true"}
-api_key_gpt4 ='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'
+api_key_gpt4 =''
 
 initial_message = (
     "Hi! I’m ProactiMate, your motivational chatbot."
