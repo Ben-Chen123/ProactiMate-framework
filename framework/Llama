@@ -1,0 +1,411 @@
+#Llama
+# Use a pipeline as a high-level helper
+import pandas as pd
+from transformers import pipeline
+import openai
+from transformers import AutoTokenizer, AutoModelForSequenceClassification,AutoModelForCausalLM
+import requests
+import json
+from llama_index.llms.llama_api import LlamaAPI
+from llama_index.core.llms import ChatMessage
+from huggingface_hub import login
+import torch
+from huggingface_hub import InferenceClient
+
+openai.api_key = ''
+openai.base_url = "https://api.chatanywhere.org"
+#openai.default_headers = {"x-foo": "true"}
+api_key_gpt4 =''
+
+login("")
+client = InferenceClient(api_key="")
+model_name = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+
+initial_message = (
+    "Hi! I’m ProactiMate, your motivational chatbot."
+    "My goal is to help you reflect on your procrastination habits and work towards overcoming them."
+    "Together, we’ll explore your thoughts and behaviors to understand what holds you back and what motivates you to move forward." 
+    "I won’t be giving you specific advice but will guide you to clarify your goals and values." 
+    "What aspect of procrastination would you like to focus on today?"
+)
+
+print(initial_message)
+conversation_history=[]
+
+conversation_history.append({"role": "assistant", "content": initial_message})
+
+def save_conversation_to_file(conversation_history, filename):
+        with open(filename, 'w') as f:
+            json.dump(conversation_history, f, indent=4)
+
+def add_content_to_json_file(new_content, filename):
+    if os.path.exists(filename):
+             with open(filename, 'r') as f:
+                existing_data = json.load(f)
+    else:
+        existing_data = []
+    
+    if isinstance(existing_data, list):
+        existing_data.append(new_content)  # Append new content if it's a list
+    elif isinstance(existing_data, dict):
+        if isinstance(new_content, dict):
+            existing_data.update(new_content)  # Update if new_content is a dictionary
+        else:
+            raise ValueError("New content must be a dictionary when existing data is a dictionary.")
+    else:
+        raise ValueError("Existing data must be a list or dictionary.")
+
+    with open(filename, 'w') as f:
+        json.dump(existing_data, f, indent=4)
+        
+def format_conversation(history):
+    formatted_history = ""
+    for message in history:
+        role = "User" if message["role"] == "user" else "Assistant"
+        formatted_history += f"{role}: {message['content']}\n"
+    return formatted_history
+
+def generate_gpt_user_input(user_input,query):
+    user_input.append({"role": "system", "content": query})
+    response = openai.chat.completions.create(
+    model="gpt-3.5-turbo",
+    messages=user_input,
+    max_tokens=500,
+    )
+    print(response.choices[0].message.content)
+    return response.choices[0].message.content
+
+
+def get_llama_response(messages):
+    completion = client.chat.completions.create(
+    model="meta-llama/Llama-3.2-3B-Instruct", 
+    messages=messages, 
+    max_tokens=500
+    )
+    print(completion.choices[0].message["content"])
+    return completion.choices[0].message["content"]
+    
+prompt_to_gpt = (
+    f"You are now a procrastinator, please have a talk with me"
+)
+
+#user_input = generate_gpt_user_input(conversation_history,prompt_to_gpt)
+user_input=input("Please input")
+conversation_history.append({"role": "user", "content": user_input})
+user_input_format=format_conversation(conversation_history)
+
+for turn in range(3):
+    assistant_response =get_llama_response(conversation_history)
+    conversation_history.append({"role": "assistant", "content": assistant_response})
+    assistant_response_format=format_conversation(conversation_history)
+    
+    user_input = generate_gpt_user_input(conversation_history,"Please mimic a user to respond to the history conversation, remember you are a user with procrastinartion")
+    conversation_history.append({"role": "user", "content": user_input})
+    user_input_format=format_conversation(conversation_history)
+    
+tokenizer= AutoTokenizer.from_pretrained("google-bert/bert-base-uncased")
+pipe_valence=pipeline("text-classification", model="results_valence/checkpoint-270",tokenizer=tokenizer,device=-1)
+pipe_labels=pipeline("text-classification", model="results_labels/checkpoint-270",tokenizer=tokenizer,device=-1)
+pipe_sublabel=pipeline("text-classification", model="results_sublabel/checkpoint-270",tokenizer=tokenizer,device=-1)
+
+Valence_mapping={
+    "LABEL_0":"ambivalence",
+    "LABEL_1":"change",
+    "LABEL_2":"sustain"
+    
+}
+
+Labels_mapping={
+    "LABEL_0":"Commitment",
+    "LABEL_1":"Reason",
+    "LABEL_2":"Taking Steps"
+}
+
+Sublabel_mapping={
+   "LABEL_0":"General Reason",
+   "LABEL_1":"ability",
+   "LABEL_2":"desire" 
+}
+
+def process_pipeline(input_text):
+
+    classifier1_output = pipe_valence(input_text)
+    classifier2_output = pipe_labels(input_text)
+    classifier3_output = pipe_sublabel(input_text)
+ 
+    mapped_output = {
+        "classifier1": Valence_mapping.get(classifier1_output[0]['label'], "Unknown Valence"),
+        "classifier2": Labels_mapping.get(classifier2_output[0]['label'], "Unknown Label"),
+        "classifier3": Sublabel_mapping.get(classifier3_output[0]['label'], "Unknown Sublabel")
+    }
+
+    return mapped_output
+
+
+print("The next step is the MI-adapted conversation")
+for turn in range(3):
+    MI_history=[]
+    format1=format_conversation(conversation_history)
+
+    nlu_output = process_pipeline(user_input)
+
+    conversation_history.append({"role": "system", "content": str(nlu_output)})
+
+
+    behaviours_df = pd.read_csv('Behaviours.csv',header=0,on_bad_lines='skip',sep=';')
+
+
+    def map_nlu_output_to_action(nlu_output, behaviours_df):
+        if nlu_output['classifier2'] in ['Taking Steps', 'Commitment']:
+             matching_row = behaviours_df[
+            (behaviours_df['Valence'] == nlu_output['classifier1']) &
+            (behaviours_df['Label'] == nlu_output['classifier2'])]
+        else:
+            matching_row = behaviours_df[
+           (behaviours_df['Valence'] == nlu_output['classifier1']) &
+           (behaviours_df['Label'] == nlu_output['classifier2']) &
+           (behaviours_df['Sublabel'] == nlu_output['classifier3'])
+           ]
+
+        if not matching_row.empty:
+            action=matching_row.iloc[0]['Action']  # Return the action from the first matching row
+            description = matching_row.iloc[0]['Description']  # Get the description from the first matching row
+            return action, description  # Return both action and description
+        else:
+            return "No matching action found, please continue the conversation without action"
+
+    # Map the NLU output to an action
+    action = map_nlu_output_to_action(nlu_output, behaviours_df)
+    conversation_history.append({"role": "system", "content": f"Suggested Action: {action}"})
+    formatted_history = format_conversation(conversation_history)
+    # Update the prompt with the action
+    prompt = (
+    f"Please generate a prompt for LLM based on the above information in English."
+    )
+
+    def get_llama_prompt(messages):
+        messages.append({"role": "system", "content":prompt})
+        completion = client.chat.completions.create(
+        model="meta-llama/Llama-3.2-3B-Instruct", 
+        messages=messages, 
+        max_tokens=500
+        )
+        return completion.choices[0].message["content"]
+
+    system_prompt =get_llama_prompt(conversation_history)
+    conversation_history.append({"role": "system", "content":system_prompt})
+
+    response =get_llama_response(conversation_history)
+    conversation_history.append({"role": "assistant", "content":response})
+    MI_history.append({"role": "assistant", "content":response})
+    user_input= generate_gpt_user_input(conversation_history,"Please mimic user to give response")
+    conversation_history.append({"role": "user", "content":user_input})
+    MI_history.append({"role": "user", "content":user_input})
+
+print("Have I forgotten anything? Please let me know if there's anything else you'd like to add.")
+prompt_add = (
+    f"Have you forgotten anything as a user? Please let me know if there's anything else you'd like to add to mimic user."
+)
+user_input_text = generate_gpt_user_input(conversation_history,prompt_add)
+conversation_history.append({"role": "user", "content":user_input_text})
+
+
+summary_output =get_llama_response(conversation_history)
+
+print("Please define the concrete next steps you would like to take:")
+next_steps_prompt=(
+    f"Please define the concrete next steps you would like to take:"
+)
+next_steps_instruction = generate_gpt_user_input(conversation_history,prompt_add)
+conversation_history.append({"role": "user", "content": next_steps_instruction})
+
+goodbye_message = "Thank you for the conversation! I wish you the best on your journey towards change. Goodbye!"
+
+conversation_history.append({"role": "assistant", "content": goodbye_message})
+
+print(goodbye_message)
+
+print("This is the evaluation process")
+
+#openai.api_key=api_key_gpt4
+#openai.base_url="https://api.openai.com/v1/"
+#def evaluation(messages,query):
+    #messages.append({"role": "system", "content": query})
+    #response = openai.chat.completions.create(
+    #model="gpt-4-turbo",
+    #messages=messages,
+    #)
+    #print(response.choices[0].message.content)
+    #del messages[-1]  # This will delete the last item
+    #return response.choices[0].message.content
+    
+evaluation_prompt_1=(
+    f"Please evaluate whether the above conversations follow the Motivational interviewing (MI) theory, and give your score based on 7-likert scale.\n"
+    f"The metrics should include:\n"
+    f"1. Cultivating Collaboration: How well the practitioner builds a cooperative relationship.\n"
+    f"2. Evocation: The degree to which the practitioner elicits the client’s ideas about change.\n"
+    f"3. Autonomy Support: Respect for the client’s right to self-direction.\n"
+    f"In a typical 7-point Likert scale, the points look like this:\n"
+    f"1=Strongly Disagree\n"
+    f"2=Disagree\n"
+    f"3=Somewhat Disagree\n"
+    f"4=Neutral (or Neither Agree nor Disagree)\n"
+    f"5=Somewhat Agree\n"
+    f"6=Agree\n"
+    f"7=Strongly Agree"
+    f"The output format should include the word score and you should be strict with the rating, which means you cannot give too many 7 scores"
+    f"Rating Examples for Cultivating Collaboration:\n"
+    f"1 (Strongly Disagree): The practitioner dominated the conversation and left no room for client input."
+    f"4 (Neutral): Some collaboration was present, but the practitioner often led the discussion without fully engaging the client."
+    f"6 (Agree): The practitioner actively fostered collaboration, but there were occasional missed opportunities to involve the client further."
+    f"Rating Examples for Evocation:\n"
+    f"2 (Disagree): The practitioner primarily provided advice without exploring the client’s motivations or thoughts."
+    f"5 (Somewhat Agree): The practitioner made efforts to evoke the client’s ideas but didn’t fully explore their motivations in depth."
+    f"7 (Strongly Agree): The practitioner consistently encouraged the client to articulate their reasons for change and built the conversation around those ideas."
+    f"Rating Examples for Autonomy Support:\n"
+    f"3 (Somewhat Disagree): The practitioner occasionally acknowledged the client’s autonomy but often directed the conversation toward their own agenda."
+    f"4 (Neutral): The practitioner showed some respect for the client’s autonomy but occasionally leaned towards giving direct advice or solutions."
+    f"7 (Strongly Agree): The practitioner consistently respected the client’s right to make their own decisions, emphasizing their control over the process."
+)
+print("Evaluation for MI")
+#evaluation(MI_history,evaluation_prompt_1)
+
+evaluation_prompt_2=(
+    f"Please evaluate the conversation based on Track specific practitioner behaviors and give quantitative answers\n"
+    f"Tracks specific practitioner behaviors include:\n"
+    f"1. Open Questions: Number of open-ended versus closed-ended questions.\n"
+    f"2. Reflections: Count of reflective listening statements and their complexity.\n"
+    f"3. MI-Adherent Behaviors: Instances where the practitioner follows MI-consistent strategies, such as affirming, emphasizing autonomy, or seeking permission.\n"
+    f"4. MI-Non-Adherent Behaviors: Behaviors that contradict MI principles, such as giving unsolicited advice or confronting"
+)
+print("Evaluation for Track specific practitioner")
+#evaluation(MI_history,evaluation_prompt_2)
+
+evaluation_prompt_3=(
+    f"Please evaluate conversation based on Client Evaluation of Motivational Interviewing (CEMI)\n"
+    f"The CEMI typically includes the following dimensions:\n"
+    f"1=Empathy and Understanding: Measures how well clients feel understood and listened to by their counselor or therapist, assessing whether they perceive the professional as empathetic and caring.\n"
+    f"2=Encouragement and Confidence Building: Assesses whether the client feels more empowered and confident in their ability to change following the MI session.\n"
+    f"3=Collaboration and Partnership: Looks at the client’s sense of working collaboratively with the counselor, rather than feeling passive or controlled in the process.\n"
+    f"4=Evocation: Examines how well the session helps the client articulate their own motivations for change rather than feeling lectured or judged.\n"
+    f"5=Relevance and Usefulness: Evaluates whether the client perceives the MI session as applicable and relevant to their unique challenges and goals.\n"
+    f"Please utilize 7-point Likert scale (from 1 = strongly disagree to 7 = strongly agree) for each item to give your ratings."
+    f"The output format should include the word score and you should be strict with the rating, which means you cannot give too many 7 scores"
+    f"Rating Examples for Empathy and Understanding:\n"
+    f"1 (Strongly Disagree): The counselor showed little interest in my perspective and didn’t seem to listen or empathize with my situation."
+    f"4 (Neutral): The counselor made some effort to understand me but didn’t fully connect with my concerns."
+    f"6 (Agree): The counselor was attentive and empathetic, making me feel understood, though there were minor gaps."
+    f"Rating Examples for Encouragement and Confidence Building:\n"
+    f"2 (Disagree): The session left me feeling unsure and didn’t build my confidence to make changes."
+    f"5 (Somewhat Agree): The session encouraged me to some extent, but I didn’t feel fully confident about taking action."
+    f"7 (Strongly Agree): The session significantly boosted my confidence and made me feel capable of achieving my goals."
+    f"Rating Examples for Collaboration and Partnership:\n"
+    f"3 (Somewhat Disagree): The counselor sometimes included me in discussions, but the process often felt one-sided."
+    f"4 (Neutral): There was some collaboration, but I didn’t feel like an equal partner in the process."
+    f"6 (Agree): The counselor worked well with me, creating a sense of partnership, though there were minor missed opportunities."
+    f"Rating Examples for Evocation:\n"
+    f"1 (Strongly Disagree): The session focused on advice rather than helping me explore my own reasons for change."
+    f"5 (Somewhat Agree): The session helped me articulate some of my motivations, but it didn’t go very deep."
+    f"7 (Strongly Agree): The session thoroughly helped me explore and express my personal motivations for change."
+    f"Rating Examples for Relevance and Usefulness:\n"
+    f"2 (Disagree): The session felt disconnected from my specific challenges and wasn’t very applicable to my goals."
+    f"4 (Neutral): Some parts of the session were relevant, but others didn’t seem useful for my situation."
+    f"6 (Agree): The session was mostly relevant and addressed my challenges, with only a few areas that felt less applicable."
+)
+print("Evaluation for CEMI")
+#evaluation(MI_history,evaluation_prompt_3)
+
+evaluation_prompt_4=(
+    f"Please evaluate conversation based on Therapeutic Alliance metrics\n"
+    f"The Therapeutic Alliance includes the following dimensions:\n"
+    f"1=Bond: The emotional connection between the therapist and client.\n"
+    f"2=Agreement on Goals: Both the client and therapist should agree on the goals of therapy and the approach.\n"
+    f"3=Agreement on Tasks: The tasks and methods used in therapy should be mutually understood and accepted by both parties.\n"
+    f"Please utilize 7-point Likert scale (from 1 = strongly disagree to 7 = strongly agree) for each item to give your ratings."
+    f"The output format should include the word score and you should be strict with the rating, which means you cannot give too many 7 scores"
+    f"Rating Examples for Bond:\n"
+    f"1 (Strongly Disagree): The therapist showed little warmth or empathy, and I didn’t feel any connection with them."
+    f"4 (Neutral): There was some level of connection, but it felt inconsistent or superficial."
+    f"6 (Agree): The therapist was warm and understanding, fostering a meaningful emotional bond, though it could have been slightly deeper."
+    f"Rating Examples for Agreement on Goals:\n"
+    f"2 (Disagree): The goals of the therapy felt unclear or misaligned with my needs."
+    f"5 (Somewhat Agree): The goals were mostly aligned, but I didn’t feel fully committed to the approach."
+    f"7 (Strongly Agree): The therapist and I had a clear and shared understanding of the therapy goals and how to achieve them."
+    f"Rating Examples for Agreement on Tasks"
+    f"1 (Strongly Disagree): The tasks felt irrelevant or were not explained well, leaving me confused about their purpose."
+    f"4 (Neutral): The tasks made sense to some extent, but there were moments of uncertainty or miscommunication."
+    f"6 (Agree): The tasks and methods were clear and relevant, with only minor areas of ambiguity or misunderstanding."
+)
+print("Evaluation for Therapeutic Alliance")
+#evaluation(MI_history,evaluation_prompt_4)
+
+evaluation_prompt_5=(
+    f"Please evaluate conversation based on Readiness to Change (RTC) metrics.\n"
+    f"RTC metrics include:\n"
+    f"Precontemplation: No intention to change for user.\n"
+    f"Contemplation: Aware of the need for change but not yet ready to commit for user.\n"
+    f"Preparation: Ready to take action and may begin small steps for user.\n"
+    f"Action: Actively modifying behavior for user.\n"
+    f"Maintenance: Sustaining the behavior change over time for user."
+    f"Please utilize 7-point Likert scale (from 1 = strongly disagree to 7 = strongly agree) for each item to give your ratings about the conversation."
+    f"The output format should include the word score and you should be strict with the rating, which means you cannot give too many 7 scores"
+    f"Rating Examples for Precontemplation:\n"
+    f"1 (Strongly Disagree): The user clearly acknowledged the problem and expressed an intent to change."
+    f"4 (Neutral): The user showed partial awareness of the problem but lacked any serious intention to change."
+    f"6 (Agree): The user remained resistant to change and showed no signs of readiness to address the issue."
+    f"Rating Examples for Contemplation:\n"
+    f"2 (Disagree): The user seemed hesitant and didn’t engage in meaningful reflection on the need for change."
+    f"5 (Somewhat Agree): The user acknowledged the need for change but remained undecided about taking the next steps."
+    f"7 (Strongly Agree): The user showed clear awareness of the need for change and thoughtfully explored options, though no commitment was made."
+    f"Rating Examples for Preparation:\n"
+    f"1 (Strongly Disagree): The user showed no interest in planning or preparing for change."
+    f"4 (Neutral): The user discussed potential actions but showed uncertainty about when or how to start."
+    f"6 (Agree): The user identified specific small steps and demonstrated readiness to begin implementing them."
+    f"Rating Examples for Action:\n"
+    f"2 (Disagree): The user expressed a willingness to act but hadn’t yet taken concrete steps to change."
+    f"5 (Somewhat Agree): The user had started making changes but struggled with consistency or follow-through."
+    f"7 (Strongly Agree): The user actively and consistently took meaningful steps to modify their behavior during the conversation."
+    f"Rating Examples for Maintenance:\n"
+    f"1 (Strongly Disagree): The user showed no effort to sustain changes or prevent relapse."
+    f"4 (Neutral): The user demonstrated some effort to maintain changes but faced challenges in consistency."
+    f"6 (Agree): The user displayed a strong commitment to maintaining their behavior changes, with only minor lapses."
+)
+
+evaluation_prompt_6=(
+    f"Please evaluate conversation based on User Engagement Scale–Short Form (UES-SF)\n"
+    f"The UES-SF typically includes questions that assess the following dimensions of engagement:\n"
+    f"1. Affective Commitment: How emotionally involved user feels with the product.\n"
+    f"2. Cognitive Engagement: The level of attention and mental effort user invests.\n"
+    f"3. Behavioral Involvement: The extent to which user participates or interacts actively"
+    f"Please utilize 7-point Likert scale (from 1 = strongly disagree to 7 = strongly agree) for each item to give your ratings about the conversation."
+    f"The output format should include the word score and you should be strict with the rating, which means you cannot give too many 7 scores"
+    f"Rating Examples for Affective Commitment:\n"
+    f"1 (Strongly Disagree): The user seemed emotionally detached and showed no enthusiasm or interest in the interaction."
+    f"4 (Neutral): The user appeared somewhat engaged emotionally, but the connection was inconsistent or shallow."
+    f"6 (Agree): The user expressed noticeable emotional involvement and interest, though there was room for deeper connection."
+    f"Rating Example for Cognitive Engagement:\n"
+    f"2 (Disagree): The user frequently seemed distracted or disengaged, showing minimal mental effort."
+    f"5 (Somewhat Agree): The user paid attention and showed moderate cognitive engagement, but their focus wavered at times."
+    f"7 (Strongly Agree): The user remained highly focused and invested significant mental effort throughout the interaction."
+    f"Rating Examples for Behavioral Involvement:\n"
+    f"1 (Strongly Disagree): The user showed little to no interaction or participation during the session."
+    f"4 (Neutral): The user participated to some extent but did not take full advantage of the interactive elements."
+    f"6 (Agree): The user actively engaged with the interaction, though their involvement was not consistent or fully immersive."
+)
+print("Evaluation for UES-SF")
+#evaluation(MI_history,evaluation_prompt_6)
+
+evaluation_results=[
+       {"Conversation history":conversation_history,
+        #"Evaluation for MI":evaluation(MI_history,evaluation_prompt_1),
+        #"Evaluation for Track specific practitioner":evaluation(MI_history,evaluation_prompt_2),
+        #"Evaluation for CEMI":evaluation(MI_history,evaluation_prompt_3),
+        #"Evaluation for Therapeutic Alliance":evaluation(MI_history,evaluation_prompt_4),
+        #"Evaluation for RTC":evaluation(MI_history,evaluation_prompt_5),
+        #"Evaluation for UES-SF":evaluation(MI_history,evaluation_prompt_6),
+       }
+]
+
+filename = 'evaluation_results_llama.json'
+#save_conversation_to_file(evaluation_results,filename)
+add_content_to_json_file(evaluation_results,filename)
