@@ -1,0 +1,177 @@
+# Train Valence classifier
+import pandas as pd
+import torch
+from sklearn.model_selection import train_test_split
+from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments,AdamW
+from torch.utils.data import Dataset
+from torch.nn import CrossEntropyLoss
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, precision_recall_curve
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import label_binarize
+
+
+# Load the annotated dataset
+data = pd.read_json('combined_dataset_annotated.json')
+
+# Prepare the dataset
+# Combine Context and Response as input
+data['input_text'] = data['Context'] + " " + data['Response']
+
+# Encode labels for Valence only
+label_map_valence = {label: idx for idx, label in enumerate(data['Valence'].unique())}
+data['valence_encoded'] = data['Valence'].map(label_map_valence)
+
+X_train, X_temp, y_train, y_temp = train_test_split(
+    data['input_text'], data['valence_encoded'], test_size=0.2, random_state=42
+)
+
+X_val, X_test, y_val, y_test = train_test_split(
+    X_temp, y_temp, test_size=0.5, random_state=42
+)
+
+
+# Load the BERT tokenizer
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+tokenizer.save_pretrained('results_valence')
+
+# Tokenize the data
+train_encodings = tokenizer(list(X_train), truncation=True, padding=True, max_length=128)
+val_encodings = tokenizer(list(X_val), truncation=True, padding=True, max_length=128)
+test_encodings = tokenizer(list(X_test), truncation=True, padding=True, max_length=128)
+
+
+# Create a PyTorch dataset
+class CustomDataset(Dataset):
+    def __init__(self, encodings, labels):
+        self.encodings = encodings
+        self.labels = labels
+
+    def __getitem__(self, idx):
+        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        item['labels'] = torch.tensor(self.labels[idx], dtype=torch.long)  # Use long for single-label
+        return item
+
+    def __len__(self):
+        return len(self.labels)
+
+
+train_dataset = CustomDataset(train_encodings, y_train.tolist())
+val_dataset = CustomDataset(val_encodings, y_val.tolist())
+test_dataset = CustomDataset(test_encodings, y_test.tolist())
+
+
+# Load the BERT model for single-label classification (Valence only)
+model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=len(label_map_valence),ignore_mismatched_sizes=True)
+
+# Freeze all layers except the last layer
+#for param in model.base_model.parameters():
+    #param.requires_grad = False
+    
+# Ensure the classifier (last layer) is not frozen
+#for param in model.classifier.parameters():
+    #param.requires_grad = True
+    
+# Define a function to compute metrics
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    predictions = torch.argmax(torch.tensor(logits), dim=-1)
+    accuracy = accuracy_score(labels, predictions)
+    precision = precision_score(labels, predictions, average='weighted') 
+    recall = recall_score(labels, predictions, average='weighted')  # Use 'weighted' for multi-class
+    f1 = f1_score(labels, predictions, average='weighted')  # Use 'weighted' for multi-class
+    return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1": f1}
+
+# Set up training arguments
+training_args = TrainingArguments(
+    output_dir='./results_valence',
+    num_train_epochs=6,
+    per_device_train_batch_size=8,
+    per_device_eval_batch_size=8,    
+    warmup_steps=500,
+    weight_decay=0.01,
+    logging_dir='./logs',
+    logging_steps=10,
+    evaluation_strategy="epoch",
+)
+
+class CustomTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False,num_items_in_batch=None):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)  
+        logits = outputs.logits
+        loss_fct = CrossEntropyLoss()
+        loss = loss_fct(logits, labels)
+        #print("Loss:", loss.item())
+        return (loss, outputs) if return_outputs else loss
+
+optimizer = AdamW(model.parameters(), lr=5e-5, weight_decay=0.01)
+
+
+# Create a Trainer instance
+trainer = CustomTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    optimizers=(optimizer, None),
+    compute_metrics=compute_metrics
+) 
+
+
+# Fine-tune the model
+trainer.train()
+
+# Evaluate the model
+trainer.evaluate()
+
+eval_results = trainer.evaluate()
+print(f"Validation Accuracy: {eval_results['eval_accuracy']:.2f}")
+print(f"Validation Precision: {eval_results['eval_precision']:.2f}")
+print(f"Validation Recall: {eval_results['eval_recall']:.2f}")
+print(f"Validation F1-Score: {eval_results['eval_f1']:.2f}")
+
+predictions = trainer.predict(val_dataset)
+logits = predictions.predictions
+true_labels = y_val.tolist()
+
+n_classes = len(label_map_valence)
+true_labels_binarized = label_binarize(true_labels, classes=range(n_classes))
+plt.figure(figsize=(10, 8))
+for i in range(n_classes):
+    precision, recall, _ = precision_recall_curve(true_labels_binarized[:, i], logits[:, i])
+    plt.plot(recall, precision, marker='.', label=f'Class {i} (Label: {list(label_map_valence.keys())[i]})')
+
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('Precision-Recall Curve for Each Class on Validation Dataset')
+plt.legend()
+plt.grid()
+plt.show()
+
+#Evaluate on the test dataset
+predictions = trainer.predict(test_dataset)
+logits = predictions.predictions
+true_labels = y_test.tolist()
+predicted_labels = torch.argmax(torch.tensor(logits), dim=-1)
+accuracy = accuracy_score(true_labels, predicted_labels)
+precision = precision_score(true_labels, predicted_labels, average='weighted')  # Use 'weighted' for multi-class
+recall = recall_score(true_labels,predicted_labels,average='weighted') 
+f1 = f1_score(true_labels, predicted_labels, average='weighted')  # Use 'weighted' for multi-class
+print(f"Test Accuracy: {accuracy:.2f}")
+print(f"Test Precision: {precision:.2f}")
+print(f"Test Recall: {recall:.2f}")
+print(f"Test F1-Score: {f1:.2f}")
+
+n_classes = len(label_map_valence)
+true_labels_binarized = label_binarize(true_labels, classes=range(n_classes))
+plt.figure(figsize=(10, 8))
+for i in range(n_classes):
+    precision, recall, _ = precision_recall_curve(true_labels_binarized[:, i], logits[:, i])
+    plt.plot(recall, precision, marker='.', label=f'Class {i} (Label: {list(label_map_valence.keys())[i]})')
+
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('Precision-Recall Curve for Each Class on Test Dataset')
+plt.legend()
+plt.grid()
+plt.show()
